@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TDC Pay Summary Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; margin: 0; }
+    .chart-container { position: relative; height: 320px; }
+    .kpi-card { transition: transform 0.15s ease, box-shadow 0.15s ease; }
+    .kpi-card:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.1); }
+    .pill { cursor: pointer; user-select: none; transition: all 0.15s ease; }
+    .pill:hover { transform: scale(1.05); }
+    .sidebar { position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+    .loader { display: flex; align-items: center; justify-content: center; height: 100vh; flex-direction: column; gap: 16px; }
+    .spinner { width: 40px; height: 40px; border: 4px solid #e2e8f0; border-top-color: #2196F3; border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media print {
+      .no-print { display: none !important; }
+      .chart-container { break-inside: avoid; page-break-inside: avoid; height: 280px; }
+      body { background: white; }
+      .sidebar { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+
+<script>
+// ============================================================
+// CONFIG: Google Sheet ID, tab GIDs, staff name mapping, colors
+// ============================================================
+var SHEET_ID = "1Ag07imVpYfnQUwtPFE4_TrNVS9ouTV5hv92jxwe1eWE";
+var YEAR_GIDS = {
+  "2022": 0,
+  "2023": 1165807367,
+  "2024": 964830999,
+  "2025": 535390501,
+  "2026": 898182160
+};
+var YEARS = Object.keys(YEAR_GIDS);
+
+// Map sheet names → dashboard display names (multiple sheet names can map to same display name = summed)
+var NAME_MAP = {
+  "Graham": "Graham", "Rosina": "Rosina", "Kat": "Kat",
+  "Sarah": "Sarah", "Sarah Total": "Sarah",
+  "Joe": "Jo", "Joe Wibsey": "Jo",
+  "Matt": "Matt", "Matt Total": "Matt", "Matt Keighley": "Matt", "Matt Idle": "Matt",
+  "Charlotte Idle": "Charlotte", "Charlotte Wibsey": "Charlotte",
+  "Pakeeza": "Pakeeza", "Matthew": "Matthew", "Jas": "Jas", "Roy": "Roy"
+};
+
+var STAFF_COLORS = {
+  "Graham": "#2196F3", "Rosina": "#4CAF50", "Kat": "#E91E63",
+  "Sarah": "#FF9800", "Charlotte": "#9C27B0", "Matt": "#00BCD4",
+  "Jo": "#795548", "Pakeeza": "#FF5722", "Matthew": "#3F51B5",
+  "Jas": "#009688", "Roy": "#CDDC39"
+};
+
+var MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+var Q_MONTHS = { Q1: [0,1,2], Q2: [3,4,5], Q3: [6,7,8], Q4: [9,10,11] };
+
+// ============================================================
+// JSONP DATA FETCHING (bypasses CORS for file:// origin)
+// ============================================================
+var _gvizCallbackCounter = 0;
+
+function fetchYearDataJSONP(year) {
+  return new Promise(function(resolve, reject) {
+    var gid = YEAR_GIDS[year];
+    var cbName = "_gvizCb_" + year + "_" + (++_gvizCallbackCounter);
+    var timeout = setTimeout(function() {
+      delete window[cbName];
+      reject(new Error("Timeout fetching " + year + " data. Check the sheet is shared as 'Anyone with the link'."));
+    }, 15000);
+
+    window[cbName] = function(response) {
+      clearTimeout(timeout);
+      delete window[cbName];
+      try {
+        if (response.status === "error") {
+          reject(new Error("Google Sheets error for " + year + ": " + (response.errors && response.errors[0] ? response.errors[0].detailed_message : "Unknown")));
+          return;
+        }
+        var table = response.table;
+        var rows = [];
+        for (var i = 0; i < table.rows.length; i++) {
+          var r = table.rows[i];
+          var row = [];
+          for (var j = 0; j < r.c.length; j++) {
+            var cell = r.c[j];
+            row.push(cell && cell.v != null ? cell.v : null);
+          }
+          rows.push(row);
+        }
+        resolve({ year: year, rows: rows });
+      } catch (err) {
+        reject(new Error("Parse error for " + year + ": " + err.message));
+      }
+    };
+
+    var script = document.createElement("script");
+    script.src = "https://docs.google.com/spreadsheets/d/" + SHEET_ID +
+      "/gviz/tq?tqx=responseHandler:" + cbName + "&gid=" + gid;
+    script.onerror = function() {
+      clearTimeout(timeout);
+      delete window[cbName];
+      reject(new Error("Network error fetching " + year + " data."));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+function extractStaffData(allYearData) {
+  // Build: { displayName: { gross: { year: [12 vals] }, pay: {...}, days: {...} } }
+  var data = {};
+
+  allYearData.forEach(function(yd) {
+    var year = yd.year;
+    var rows = yd.rows;
+    var currentStaff = null;
+    var pendingDays = null; // "Days worked" appears BEFORE the staff name it belongs to
+
+    function extractVals(row, isCurrency) {
+      var vals = [];
+      for (var m = 3; m < 15; m++) {
+        var cellVal = row[m];
+        var num = (cellVal != null && cellVal !== "") ? Number(cellVal) : 0;
+        if (isNaN(num)) num = 0;
+        vals.push(isCurrency ? +(num / 1000).toFixed(1) : +num.toFixed(2));
+      }
+      return vals;
+    }
+
+    function assignMetric(staffName, metricKey, vals) {
+      if (!data[staffName]) {
+        data[staffName] = { color: STAFF_COLORS[staffName] || "#999", gross: {}, pay: {}, days: {}, grossPerDay: {} };
+      }
+      if (!data[staffName][metricKey][year]) {
+        data[staffName][metricKey][year] = vals;
+      } else {
+        var existing = data[staffName][metricKey][year];
+        for (var k = 0; k < 12; k++) {
+          existing[k] = +((existing[k] || 0) + vals[k]).toFixed(1);
+        }
+      }
+    }
+
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      // gviz returns raw values: col 0 = name (string|null), col 2 = metric (string|null)
+      var nameCell = row[0] != null ? String(row[0]).trim() : "";
+      var metricCell = row[2] != null ? String(row[2]).trim() : "";
+
+      // "Days worked" in col C comes BEFORE the staff name it belongs to
+      // Buffer it and flush when the next staff name appears
+      if (metricCell === "Days worked") {
+        pendingDays = extractVals(row, false);
+        continue;
+      }
+
+      // If col A has a recognized name, start a new staff block
+      if (nameCell && NAME_MAP.hasOwnProperty(nameCell)) {
+        currentStaff = NAME_MAP[nameCell];
+        // Flush any buffered "Days worked" to this staff member
+        if (pendingDays) {
+          assignMetric(currentStaff, "days", pendingDays);
+          pendingDays = null;
+        }
+      } else if (nameCell && !NAME_MAP.hasOwnProperty(nameCell)) {
+        // Unknown name (site totals, headers, etc.) — skip
+        currentStaff = null;
+        pendingDays = null; // discard any pending days if we hit an unrecognised section
+      }
+
+      if (!currentStaff) continue;
+
+      // Determine metric type
+      var metricKey = null;
+      var isCurrency = false;
+      if (metricCell === "Gross") { metricKey = "gross"; isCurrency = true; }
+      else if (metricCell === "Pay") { metricKey = "pay"; isCurrency = true; }
+      else if (metricCell === "Gross/days") { metricKey = "grossPerDay"; isCurrency = false; }
+
+      if (!metricKey) continue;
+
+      assignMetric(currentStaff, metricKey, extractVals(row, isCurrency));
+    }
+  });
+
+  // Back-calculate "days" for staff who have grossPerDay but no days worked
+  // days = gross_raw / grossPerDay  (gross is stored in £k, grossPerDay is raw £)
+  Object.keys(data).forEach(function(name) {
+    var sd = data[name];
+    Object.keys(sd.grossPerDay || {}).forEach(function(year) {
+      if (!sd.days[year] || !sd.days[year].some(function(v) { return v > 0; })) {
+        var grossArr = sd.gross[year];
+        var gpdArr = sd.grossPerDay[year];
+        if (grossArr && gpdArr) {
+          sd.days[year] = [];
+          for (var i = 0; i < 12; i++) {
+            var grossRaw = (grossArr[i] || 0) * 1000; // convert £k back to £
+            var gpd = gpdArr[i] || 0;
+            sd.days[year].push(gpd > 0 ? +(grossRaw / gpd).toFixed(1) : 0);
+          }
+        }
+      }
+    });
+    // Clean up grossPerDay — not needed for charts
+    delete sd.grossPerDay;
+  });
+
+  return data;
+}
+
+function fetchAllData() {
+  var promises = YEARS.map(function(y) { return fetchYearDataJSONP(y); });
+  return Promise.all(promises).then(function(results) {
+    return extractStaffData(results);
+  });
+}
+
+// ============================================================
+// MONTHLY CACHE: only fetch from Sheets when a new full month
+// is available since the last pull. Otherwise use localStorage.
+// ============================================================
+var CACHE_KEY = "tdc_pay_data";
+var CACHE_TS_KEY = "tdc_pay_fetched";
+
+function needsFreshPull() {
+  try {
+    var lastFetched = localStorage.getItem(CACHE_TS_KEY);
+    if (!lastFetched) return true; // never fetched
+    var lastDate = new Date(lastFetched);
+    var now = new Date();
+    // A new full month is available if we've moved to a new month since last fetch
+    // e.g. fetched in Feb → now it's Mar (or later) → Feb data is complete → re-pull
+    if (now.getFullYear() > lastDate.getFullYear()) return true;
+    if (now.getFullYear() === lastDate.getFullYear() && now.getMonth() > lastDate.getMonth()) return true;
+    return false;
+  } catch (e) { return true; }
+}
+
+function getCachedData() {
+  try {
+    var raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
+}
+
+function cacheData(data) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+    localStorage.setItem(CACHE_TS_KEY, new Date().toISOString());
+  } catch (e) { /* storage full or unavailable — silent fail */ }
+}
+
+function getLastFetchedDate() {
+  try {
+    var ts = localStorage.getItem(CACHE_TS_KEY);
+    return ts ? new Date(ts).toLocaleDateString("en-GB") : null;
+  } catch (e) { return null; }
+}
+
+function loadData() {
+  if (!needsFreshPull()) {
+    var cached = getCachedData();
+    if (cached) return Promise.resolve({ data: cached, fromCache: true });
+  }
+  return fetchAllData().then(function(data) {
+    cacheData(data);
+    return { data: data, fromCache: false };
+  });
+}
+</script>
+
+<div id="root"></div>
+<script>
+var useState = React.useState;
+var useEffect = React.useEffect;
+var useRef = React.useRef;
+var useMemo = React.useMemo;
+var e = React.createElement;
+
+function linearRegression(data) {
+  var pts = [];
+  for (var i = 0; i < data.length; i++) {
+    if (data[i] !== null && data[i] !== undefined && data[i] > 0) pts.push([i, data[i]]);
+  }
+  if (pts.length < 2) return null;
+  var n = pts.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (var j = 0; j < n; j++) { sx += pts[j][0]; sy += pts[j][1]; sxx += pts[j][0]*pts[j][0]; sxy += pts[j][0]*pts[j][1]; }
+  var slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+  var intercept = (sy - slope * sx) / n;
+  return data.map(function(_, i) { return +(slope * i + intercept).toFixed(2); });
+}
+
+function buildTimeline(selectedYears, yearQuarters) {
+  var timeline = [];
+  var sortedYrs = Array.from(selectedYears).sort();
+  sortedYrs.forEach(function(yr) {
+    var qs = yearQuarters[yr] || new Set(["Q1","Q2","Q3","Q4"]);
+    var activeMonths = [];
+    ["Q1","Q2","Q3","Q4"].forEach(function(q) {
+      if (qs.has(q)) Q_MONTHS[q].forEach(function(m) { activeMonths.push(m); });
+    });
+    activeMonths.sort(function(a,b) { return a - b; });
+    activeMonths.forEach(function(m) { timeline.push({ year: yr, month: m }); });
+  });
+  return timeline;
+}
+
+function ChartComponent(props) {
+  var canvasRef = useRef(null);
+  var chartRef = useRef(null);
+  var type = props.type;
+  var data = props.data;
+  var options = props.options;
+  var height = props.height;
+  var dataStr = JSON.stringify(data);
+  var optStr = JSON.stringify(options);
+
+  useEffect(function() {
+    if (chartRef.current) chartRef.current.destroy();
+    if (!canvasRef.current) return;
+    var ctx = canvasRef.current.getContext("2d");
+    var basePlugins = { legend: { display: false }, datalabels: { display: false } };
+    var extraPlugins = (options && options.plugins) || {};
+    var mergedPlugins = Object.assign({}, basePlugins, extraPlugins);
+    var baseOpts = {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 400 },
+      plugins: mergedPlugins,
+      interaction: { mode: "index", intersect: false },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { family: "system-ui", size: 10 }, maxRotation: 45 } },
+        y: { beginAtZero: true, grid: { color: "#e2e8f0" }, ticks: { font: { family: "system-ui", size: 11 } } }
+      }
+    };
+    var extraOpts = {};
+    if (options) { Object.keys(options).forEach(function(k) { if (k !== "plugins") extraOpts[k] = options[k]; }); }
+    chartRef.current = new Chart(ctx, { type: type, data: JSON.parse(dataStr), options: Object.assign(baseOpts, extraOpts) });
+    return function() { if (chartRef.current) chartRef.current.destroy(); };
+  }, [type, dataStr, optStr]);
+
+  return e("div", { className: "chart-container", style: { height: height || 320 } }, e("canvas", { ref: canvasRef }));
+}
+
+function Pill(props) {
+  var style = {
+    borderColor: props.active ? props.color : "#cbd5e1",
+    background: props.active ? (props.color + "18") : "#f1f5f9",
+    color: props.active ? "#334155" : "#94a3b8",
+    opacity: props.active ? 1 : 0.6,
+    textDecoration: props.active ? "none" : "line-through"
+  };
+  return e("button", { onClick: props.onClick, onDoubleClick: props.onDoubleClick,
+    className: "pill flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border", style: style },
+    e("span", { className: "w-2.5 h-2.5 rounded-full inline-block flex-shrink-0",
+      style: { background: props.active ? props.color : "#cbd5e1" } }),
+    props.label
+  );
+}
+
+function App() {
+  var loadState = useState(null); // null = loading, object = data, string = error
+  var staffData = loadState[0];
+  var setStaffData = loadState[1];
+  var cacheInfo = useState({ fromCache: false, lastFetched: null });
+  var cacheStatus = cacheInfo[0];
+  var setCacheStatus = cacheInfo[1];
+
+  // Load data on mount (from cache or fresh pull)
+  useEffect(function() {
+    loadData()
+      .then(function(result) {
+        setStaffData(result.data);
+        setCacheStatus({ fromCache: result.fromCache, lastFetched: getLastFetchedDate() });
+      })
+      .catch(function(err) {
+        // If fetch fails, try falling back to stale cache
+        var stale = getCachedData();
+        if (stale) {
+          setStaffData(stale);
+          setCacheStatus({ fromCache: true, lastFetched: getLastFetchedDate(), stale: true });
+        } else {
+          setStaffData("Error: " + err.message + ". Check the sheet is shared as 'Anyone with the link' and try refreshing.");
+        }
+      });
+  }, []);
+
+  function forceRefresh() {
+    setStaffData(null);
+    fetchAllData()
+      .then(function(data) {
+        cacheData(data);
+        setStaffData(data);
+        setCacheStatus({ fromCache: false, lastFetched: getLastFetchedDate() });
+      })
+      .catch(function(err) {
+        setStaffData("Error: " + err.message);
+      });
+  }
+
+  if (staffData === null) {
+    return e("div", { className: "loader" },
+      e("div", { className: "spinner" }),
+      e("p", { className: "text-slate-500 text-sm" }, needsFreshPull() ? "Pulling fresh data from Google Sheets..." : "Loading cached data...")
+    );
+  }
+  if (typeof staffData === "string") {
+    return e("div", { className: "loader" },
+      e("p", { className: "text-red-500 text-sm font-semibold" }, staffData)
+    );
+  }
+
+  return e(Dashboard, { staffData: staffData, cacheStatus: cacheStatus, onForceRefresh: forceRefresh });
+}
+
+function Dashboard(props) {
+  var STAFF_DATA = props.staffData;
+  var cacheStatus = props.cacheStatus || {};
+  var onForceRefresh = props.onForceRefresh;
+  var STAFF_NAMES = Object.keys(STAFF_DATA);
+  var allItems = STAFF_NAMES.concat(["Total"]);
+  var totalColor = "#607D8B";
+
+  var yearState = useState(function() { return new Set(["2025"]); });
+  var selectedYears = yearState[0];
+  var setSelectedYears = yearState[1];
+
+  var quarterState = useState(function() {
+    var init = {};
+    YEARS.forEach(function(y) { init[y] = new Set(["Q1","Q2","Q3","Q4"]); });
+    return init;
+  });
+  var yearQuarters = quarterState[0];
+  var setYearQuarters = quarterState[1];
+
+  var staffState = useState(function() { return new Set(allItems); });
+  var activeStaff = staffState[0];
+  var setActiveStaff = staffState[1];
+
+  var trendState = useState(true);
+  var showTrends = trendState[0];
+  var setShowTrends = trendState[1];
+
+  var sortedYears = useMemo(function() { return Array.from(selectedYears).sort(); }, [selectedYears]);
+  var primaryYear = sortedYears[sortedYears.length - 1] || "2025";
+
+  var timeline = useMemo(function() { return buildTimeline(selectedYears, yearQuarters); }, [selectedYears, yearQuarters]);
+  var timelineLabels = useMemo(function() {
+    return timeline.map(function(t) { return MONTHS_SHORT[t.month] + " " + t.year.slice(2); });
+  }, [timeline]);
+
+  function toggleYear(y) {
+    setSelectedYears(function(prev) {
+      var next = new Set(prev);
+      if (next.has(y)) { if (next.size > 1) next.delete(y); } else next.add(y);
+      return next;
+    });
+  }
+  function isolateYear(y) { setSelectedYears(new Set([y])); }
+  function toggleQuarterForYear(year, q) {
+    setYearQuarters(function(prev) {
+      var next = {};
+      Object.keys(prev).forEach(function(k) { next[k] = new Set(prev[k]); });
+      var qs = next[year];
+      if (qs.has(q)) { if (qs.size > 1) qs.delete(q); } else qs.add(q);
+      return next;
+    });
+  }
+  function toggleStaff(name) {
+    setActiveStaff(function(prev) {
+      var next = new Set(prev);
+      if (next.has(name)) { if (next.size > 1) next.delete(name); } else next.add(name);
+      return next;
+    });
+  }
+  function isolateStaff(name) { setActiveStaff(new Set([name])); }
+  function showAllStaff() { setActiveStaff(new Set(allItems)); }
+
+  function getVal(name, metric, year, month) {
+    if (name === "Total") {
+      var sum = 0;
+      STAFF_NAMES.forEach(function(n) {
+        var d = STAFF_DATA[n][metric];
+        if (d && d[year] && d[year][month] !== undefined) sum += d[year][month];
+      });
+      return sum;
+    }
+    var d = STAFF_DATA[name] && STAFF_DATA[name][metric];
+    if (!d || !d[year]) return 0;
+    return d[year][month] || 0;
+  }
+
+  function getTimelineData(name, metric) {
+    return timeline.map(function(t) { return getVal(name, metric, t.year, t.month); });
+  }
+
+  function buildLineData(metric) {
+    var datasets = [];
+    allItems.forEach(function(name) {
+      if (!activeStaff.has(name)) return;
+      var data = getTimelineData(name, metric);
+      if (!data.some(function(v) { return v > 0; })) return;
+      var color = name === "Total" ? totalColor : (STAFF_DATA[name] ? STAFF_DATA[name].color : "#999");
+      datasets.push({
+        label: name, data: data, borderColor: color, backgroundColor: color + "33",
+        tension: 0.3, pointRadius: 3, borderWidth: name === "Total" ? 3 : 2,
+        borderDash: name === "Total" ? [6, 3] : []
+      });
+      if (showTrends) {
+        var trend = linearRegression(data);
+        if (trend) {
+          datasets.push({
+            label: name + " trend", data: trend, borderColor: color + "55",
+            backgroundColor: "transparent", borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, tension: 0
+          });
+        }
+      }
+    });
+    return { labels: timelineLabels, datasets: datasets };
+  }
+
+  function buildGrossPerDayData() {
+    var datasets = [];
+    allItems.forEach(function(name) {
+      if (!activeStaff.has(name)) return;
+      var data = timeline.map(function(t) {
+        var gross = getVal(name, "gross", t.year, t.month);
+        var days = getVal(name, "days", t.year, t.month);
+        return days > 0 ? +(gross / days * 1000).toFixed(0) : null;
+      });
+      if (!data.some(function(v) { return v !== null && v > 0; })) return;
+      var color = name === "Total" ? totalColor : (STAFF_DATA[name] ? STAFF_DATA[name].color : "#999");
+      datasets.push({
+        label: name, data: data, borderColor: color, backgroundColor: color + "33",
+        tension: 0.3, pointRadius: 3, borderWidth: name === "Total" ? 3 : 2,
+        borderDash: name === "Total" ? [6, 3] : [], spanGaps: true
+      });
+      if (showTrends) {
+        var trend = linearRegression(data);
+        if (trend) {
+          datasets.push({
+            label: name + " trend", data: trend, borderColor: color + "55",
+            backgroundColor: "transparent", borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, tension: 0
+          });
+        }
+      }
+    });
+    return { labels: timelineLabels, datasets: datasets };
+  }
+
+  function buildAnnualTotalsData() {
+    var datasets = [];
+    var activeYears = YEARS.filter(function(y) {
+      var hasData = false;
+      STAFF_NAMES.forEach(function(n) {
+        if (STAFF_DATA[n].gross[y] && STAFF_DATA[n].gross[y].some(function(v) { return v > 0; })) hasData = true;
+      });
+      return hasData;
+    });
+    allItems.forEach(function(name) {
+      if (!activeStaff.has(name)) return;
+      var color = name === "Total" ? totalColor : (STAFF_DATA[name] ? STAFF_DATA[name].color : "#999");
+      var totals = activeYears.map(function(y) {
+        if (name === "Total") {
+          var sum = 0;
+          STAFF_NAMES.forEach(function(n) { var d = STAFF_DATA[n].gross[y]; if (d) d.forEach(function(v) { sum += (v || 0); }); });
+          return +sum.toFixed(1);
+        }
+        var d = STAFF_DATA[name] && STAFF_DATA[name].gross[y];
+        return d ? +d.reduce(function(s, v) { return s + (v || 0); }, 0).toFixed(1) : 0;
+      });
+      datasets.push({ label: name, data: totals, backgroundColor: color + "CC", borderColor: color, borderWidth: 1, borderRadius: 4 });
+    });
+    return { labels: activeYears, datasets: datasets };
+  }
+
+  var kpis = useMemo(function() {
+    var totalGross = 0, totalPay = 0, totalDays = 0, count = 0;
+    STAFF_NAMES.forEach(function(name) {
+      var sd = STAFF_DATA[name];
+      var g = sd.gross[primaryYear]; var p = sd.pay[primaryYear]; var d = sd.days[primaryYear];
+      if (g) g.forEach(function(v) { totalGross += (v || 0); });
+      if (p) p.forEach(function(v) { totalPay += (v || 0); });
+      if (d) d.forEach(function(v) { if (v > 0) { totalDays += v; count++; } });
+    });
+    var avgDays = count > 0 ? (totalDays / count).toFixed(1) : "0";
+    var avgGPD = totalDays > 0 ? ((totalGross / totalDays) * 1000).toFixed(0) : "0";
+    var prevYear = String(parseInt(primaryYear) - 1);
+    var prevGross = 0, prevPay = 0;
+    STAFF_NAMES.forEach(function(name) {
+      var sd = STAFF_DATA[name];
+      if (sd.gross[prevYear]) sd.gross[prevYear].forEach(function(v) { prevGross += (v || 0); });
+      if (sd.pay[prevYear]) sd.pay[prevYear].forEach(function(v) { prevPay += (v || 0); });
+    });
+    return { totalGross: totalGross, totalPay: totalPay, avgDays: avgDays, avgGPD: avgGPD, prevGross: prevGross, prevPay: prevPay };
+  }, [primaryYear, STAFF_DATA]);
+
+  var grossData = useMemo(function() { return buildLineData("gross"); }, [timeline, activeStaff, showTrends, STAFF_DATA]);
+  var payData = useMemo(function() { return buildLineData("pay"); }, [timeline, activeStaff, showTrends, STAFF_DATA]);
+  var daysData = useMemo(function() { return buildLineData("days"); }, [timeline, activeStaff, showTrends, STAFF_DATA]);
+  var gpdData = useMemo(function() { return buildGrossPerDayData(); }, [timeline, activeStaff, showTrends, STAFF_DATA]);
+  var annualData = useMemo(function() { return buildAnnualTotalsData(); }, [activeStaff, STAFF_DATA]);
+
+  function pctChange(curr, prev) {
+    if (!prev || prev === 0) return null;
+    return ((curr - prev) / prev * 100).toFixed(1);
+  }
+  var grossChange = pctChange(kpis.totalGross, kpis.prevGross);
+  var payChange = pctChange(kpis.totalPay, kpis.prevPay);
+
+  var charts = [
+    { id: "gross", title: "Gross Revenue (\u00A3k)", data: grossData, type: "line" },
+    { id: "pay", title: "Pay (\u00A3k)", data: payData, type: "line" },
+    { id: "days", title: "Days Worked", data: daysData, type: "line" },
+    { id: "gpd", title: "Gross per Day (\u00A3)", data: gpdData, type: "line" },
+    { id: "annual", title: "Annual Gross Totals (\u00A3k)", data: annualData, type: "bar" }
+  ];
+
+  return e("div", { className: "flex min-h-screen" },
+    // SIDEBAR
+    e("div", { className: "sidebar w-64 flex-shrink-0 bg-white border-r border-slate-200 p-5 no-print" },
+      e("div", { className: "mb-6" },
+        e("h1", { className: "text-lg font-bold text-slate-800" }, "TDC Pay Summary"),
+        e("p", { className: "text-xs text-slate-500 mt-1" }, "Taylored Dental Care")
+      ),
+
+      // Years with nested per-year quarter buttons
+      e("div", { className: "mb-5" },
+        e("div", { className: "text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2" }, "Years"),
+        e("p", { className: "text-[10px] text-slate-400 mb-2" }, "Click toggle \u2022 Double-click isolate"),
+        e("div", { className: "space-y-2" },
+          YEARS.map(function(yr) {
+            var isActive = selectedYears.has(yr);
+            return e("div", { key: yr },
+              e("button", {
+                onClick: function() { toggleYear(yr); },
+                onDoubleClick: function() { isolateYear(yr); },
+                className: "pill text-xs px-3 py-1.5 rounded-full border font-medium",
+                style: { borderColor: isActive ? "#2196F3" : "#e2e8f0", background: isActive ? "#2196F3" : "white",
+                  color: isActive ? "white" : "#64748b", opacity: isActive ? 1 : 0.5 }
+              }, yr),
+              isActive ? e("div", { className: "flex gap-1 ml-4 mt-1" },
+                ["Q1","Q2","Q3","Q4"].map(function(q) {
+                  var qActive = yearQuarters[yr] && yearQuarters[yr].has(q);
+                  return e("button", { key: q, onClick: function() { toggleQuarterForYear(yr, q); },
+                    className: "text-[9px] px-1.5 py-0.5 rounded border font-medium transition-all",
+                    style: { borderColor: qActive ? "#6366f1" : "#e2e8f0", background: qActive ? "#6366f118" : "white",
+                      color: qActive ? "#4f46e5" : "#94a3b8", opacity: qActive ? 1 : 0.4 }
+                  }, q);
+                })
+              ) : null
+            );
+          })
+        )
+      ),
+
+      // Staff pills
+      e("div", { className: "mb-5" },
+        e("div", { className: "text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2" }, "Staff"),
+        e("p", { className: "text-[10px] text-slate-400 mb-2" }, "Click toggle \u2022 Double-click isolate"),
+        e("div", { className: "flex flex-col gap-1.5" },
+          allItems.map(function(name) {
+            return e(Pill, { key: name, label: name,
+              color: name === "Total" ? totalColor : (STAFF_DATA[name] ? STAFF_DATA[name].color : "#999"),
+              active: activeStaff.has(name),
+              onClick: function() { toggleStaff(name); },
+              onDoubleClick: function() { isolateStaff(name); }
+            });
+          })
+        ),
+        e("button", { onClick: showAllStaff, className: "mt-3 text-[10px] text-blue-500 hover:text-blue-700 underline" }, "Show all")
+      ),
+
+      // Trend Lines toggle
+      e("div", { className: "mb-5" },
+        e("div", { className: "text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2" }, "Options"),
+        e("button", {
+          onClick: function() { setShowTrends(function(p) { return !p; }); },
+          className: "pill flex items-center gap-2 text-xs px-3 py-1.5 rounded-full border font-medium w-full",
+          style: { borderColor: showTrends ? "#10b981" : "#e2e8f0", background: showTrends ? "#10b98118" : "#f1f5f9",
+            color: showTrends ? "#059669" : "#94a3b8" }
+        },
+          e("span", { className: "w-2.5 h-2.5 rounded-full inline-block flex-shrink-0",
+            style: { background: showTrends ? "#10b981" : "#cbd5e1" } }),
+          "Trend Lines"
+        )
+      ),
+
+      // KPIs
+      e("div", { className: "mb-4" },
+        e("div", { className: "text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2" }, "KPIs (" + primaryYear + ")"),
+        e("div", { className: "space-y-2" },
+          e("div", { className: "kpi-card bg-slate-50 rounded-lg p-3" },
+            e("div", { className: "text-[10px] text-slate-500" }, "Total Gross"),
+            e("div", { className: "text-lg font-bold text-slate-800" }, "\u00A3" + kpis.totalGross.toFixed(0) + "k"),
+            grossChange ? e("div", { className: "text-[10px] font-semibold " + (grossChange > 0 ? "text-emerald-600" : "text-red-500") },
+              (grossChange > 0 ? "\u25B2" : "\u25BC") + " " + Math.abs(grossChange) + "% vs " + (parseInt(primaryYear) - 1)) : null
+          ),
+          e("div", { className: "kpi-card bg-slate-50 rounded-lg p-3" },
+            e("div", { className: "text-[10px] text-slate-500" }, "Total Pay"),
+            e("div", { className: "text-lg font-bold text-slate-800" }, "\u00A3" + kpis.totalPay.toFixed(0) + "k"),
+            payChange ? e("div", { className: "text-[10px] font-semibold " + (payChange > 0 ? "text-red-500" : "text-emerald-600") },
+              (payChange > 0 ? "\u25B2" : "\u25BC") + " " + Math.abs(payChange) + "% vs " + (parseInt(primaryYear) - 1)) : null
+          ),
+          e("div", { className: "kpi-card bg-slate-50 rounded-lg p-3" },
+            e("div", { className: "text-[10px] text-slate-500" }, "Avg Days/Month"),
+            e("div", { className: "text-lg font-bold text-slate-800" }, kpis.avgDays)
+          ),
+          e("div", { className: "kpi-card bg-slate-50 rounded-lg p-3" },
+            e("div", { className: "text-[10px] text-slate-500" }, "Avg Gross/Day"),
+            e("div", { className: "text-lg font-bold text-slate-800" }, "\u00A3" + Number(kpis.avgGPD).toLocaleString())
+          )
+        )
+      ),
+      e("div", { className: "mt-4 space-y-2" },
+        e("div", { className: "text-[9px] text-slate-400" },
+          cacheStatus.fromCache ? "Cached data" : "Fresh pull",
+          cacheStatus.lastFetched ? (" \u2022 Last updated: " + cacheStatus.lastFetched) : "",
+          cacheStatus.stale ? " \u2022 (stale)" : ""
+        ),
+        e("button", {
+          onClick: onForceRefresh,
+          className: "text-[10px] text-blue-500 hover:text-blue-700 underline cursor-pointer"
+        }, "\u21BB Refresh now")
+      )
+    ),
+
+    // MAIN CONTENT — CHARTS
+    e("div", { className: "flex-1 p-6 overflow-y-auto" },
+      e("div", { className: "max-w-5xl mx-auto space-y-5" },
+        charts.map(function(chart) {
+          return e("div", { key: chart.id, className: "bg-white rounded-xl shadow-sm border border-slate-100 p-5" },
+            e("h2", { className: "text-base font-semibold text-slate-700 mb-4" }, chart.title),
+            e(ChartComponent, { type: chart.type, data: chart.data, height: 320,
+              options: { plugins: { tooltip: { filter: function(item) { return item.dataset.label && item.dataset.label.indexOf("trend") === -1; } } } }
+            })
+          );
+        })
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+</script>
+</body>
+</html>
